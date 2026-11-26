@@ -6,7 +6,7 @@
 
 1. 节点使用 `--write-fills --write-misc-events --stream-with-block-info`，让采集器读取带区块信息的输出。
 2. 在 [config/config.yaml](config/config.yaml) 中设置 `collector.data_dir` 为节点数据根目录。服务需要读取源文件，并能向断点文件所在目录写入。
-3. 使用 Go 1.24 或更新版本，在项目根目录运行 `go run .`。默认连接地址为 `ws://localhost:8080/ws`。
+3. 使用 Go 1.26.11 或更新版本，在项目根目录运行 `go run .`。默认连接地址为 `ws://localhost:8080/ws`。
 
 `collector.retention` 控制源文件保留时长，默认 `"0s"` 禁用清理。设为 `"72h"` 后，采集器会清理已完整采集、所属小时结束时间和文件修改时间都超过 72 小时的源文件。每个流最新小时的文件始终保留。启用清理后，服务需要有权删除这些源文件。
 
