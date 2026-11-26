@@ -1,0 +1,11 @@
+server:
+  address: ":8080"
+
+collector:
+  data_dir: /home/hl/hl/data
+  # 留空时使用数据目录下的 .hyperliquid-collector.json。
+  checkpoint_path: ""
+  # 单条 JSONL 记录的字节上限。
+  max_record_bytes: 8388608
+  # 源文件保留时长，例如 "72h"。默认 "0s" 禁用清理。
+  retention: "0s"
