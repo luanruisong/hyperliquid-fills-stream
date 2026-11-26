@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,116 +18,258 @@ import (
 	collector "github.com/luanruisong/hyperliquid-collector"
 )
 
+const (
+	fillsFile     = "node_fills_streaming/hourly/20261126/3"
+	miscFile      = "misc_events_streaming/hourly/20261126/3"
+	twapFile      = "node_twap_statuses_streaming/hourly/20261126/3"
+	fillEvents    = `[["0xabc",{"coin":"ETH","px":"3600","sz":"0.2"}]]`
+	miscEvents    = `[{"type":"funding","delta":"0.5"}]`
+	twapEvents    = `[{"status":"activated","twapId":42}]`
+	testBlockTime = "2026-11-26T03:00:00.123456789Z"
+	testLocalTime = "2026-11-26T03:00:01.987654321Z"
+	testIOTimeout = 5 * time.Second
+)
+
 func TestDiskRecordsReachOnlySubscribers(t *testing.T) {
 	dir := t.TempDir()
-	writeRecord := func(stream collector.Stream, block int) {
-		t.Helper()
-		hour := filepath.Join(dir, string(stream), "hourly", "20261126")
-		if err := os.MkdirAll(hour, 0700); err != nil {
-			t.Fatal(err)
-		}
-		events := `[{"status":"ok"}]`
-		if stream == collector.Fills {
-			events = `[["0xabc",{"px":"3600"}]]`
-		}
-		line := fmt.Sprintf(`{"block_number":%d,"block_time":"2026-11-26T03:00:00.123456789Z","local_time":"2026-11-26T03:00:01Z","events":%s}`+"\n", block, events)
-		file, err := os.OpenFile(filepath.Join(hour, "3"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = file.WriteString(line)
-		if err := errors.Join(err, file.Close()); err != nil {
-			t.Fatal(err)
-		}
-	}
+	endpoint := startTestWebSocket(t)
+	first := dialTestSubscriber(t, endpoint)
+	second := dialTestSubscriber(t, endpoint)
+	idle := dialTestSubscriber(t, endpoint)
 
-	source, err := collector.New(collector.Config{DataDir: dir})
+	subscription(t, first, "subscribe", "fills", "subscribed")
+	subscription(t, first, "subscribe", "fills", "subscribed")
+	subscription(t, first, "subscribe", "twapStatuses", "subscribed")
+	subscription(t, second, "subscribe", "fills", "subscribed")
+	subscription(t, second, "subscribe", "miscEvents", "subscribed")
+	startTestCollector(t, collector.Config{DataDir: dir}, endpoint.hub)
+
+	appendNodeFile(t, dir, fillsFile, nodeRecord(1, fillEvents))
+	expectData(t, first, "fills", 1, fillEvents)
+	expectData(t, second, "fills", 1, fillEvents)
+
+	appendNodeFile(t, dir, miscFile, nodeRecord(2, miscEvents))
+	expectData(t, second, "miscEvents", 2, miscEvents)
+	appendNodeFile(t, dir, twapFile, nodeRecord(3, twapEvents))
+	expectData(t, first, "twapStatuses", 3, twapEvents)
+
+	// Each reply follows any data already queued for that connection.
+	subscription(t, idle, "unsubscribe", "fills", "unsubscribed")
+	subscription(t, first, "unsubscribe", "fills", "unsubscribed")
+	appendNodeFile(t, dir, fillsFile, nodeRecord(4, fillEvents))
+	expectData(t, second, "fills", 4, fillEvents)
+
+	appendNodeFile(t, dir, twapFile, nodeRecord(5, twapEvents))
+	expectData(t, first, "twapStatuses", 5, twapEvents)
+	subscription(t, second, "unsubscribe", "miscEvents", "unsubscribed")
+	subscription(t, idle, "unsubscribe", "twapStatuses", "unsubscribed")
+}
+
+func TestDiskBroadcastWaitsForCompleteLinesAndFollowsNewDay(t *testing.T) {
+	dir := t.TempDir()
+	endpoint := startTestWebSocket(t)
+	subscriber := dialTestSubscriber(t, endpoint)
+	subscription(t, subscriber, "subscribe", "fills", "subscribed")
+	startTestCollector(t, collector.Config{DataDir: dir}, endpoint.hub)
+
+	line := nodeRecord(10, fillEvents)
+	const nextFill = `[["0xdef",{"coin":"ETH","px":"3601","sz":"0.3"}]]`
+	next := strings.TrimSuffix(nodeRecord(10, nextFill), "}\n")
+	appendNodeFile(t, dir, fillsFile, line+next)
+	expectData(t, subscriber, "fills", 10, fillEvents)
+	subscription(t, subscriber, "subscribe", "fills", "subscribed")
+	appendNodeFile(t, dir, fillsFile, "}\n")
+	expectData(t, subscriber, "fills", 10, nextFill)
+
+	const nextDay = "node_fills_streaming/hourly/20261127/0"
+	appendNodeFile(t, dir, nextDay, nodeRecord(11, fillEvents))
+	expectData(t, subscriber, "fills", 11, fillEvents)
+}
+
+func TestDiskBroadcastResumesFromCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	cfg := collector.Config{DataDir: dir, CheckpointPath: filepath.Join(t.TempDir(), "checkpoint.json")}
+
+	firstEndpoint := startTestWebSocket(t)
+	first := dialTestSubscriber(t, firstEndpoint)
+	subscription(t, first, "subscribe", "fills", "subscribed")
+	stop := startTestCollector(t, cfg, firstEndpoint.hub)
+
+	appendNodeFile(t, dir, fillsFile, nodeRecord(20, fillEvents))
+	expectData(t, first, "fills", 20, fillEvents)
+	stop()
+	appendNodeFile(t, dir, fillsFile, nodeRecord(21, fillEvents))
+
+	restarted := startTestWebSocket(t)
+	subscriber := dialTestSubscriber(t, restarted)
+	subscription(t, subscriber, "subscribe", "fills", "subscribed")
+	startTestCollector(t, cfg, restarted.hub)
+	expectData(t, subscriber, "fills", 21, fillEvents)
+
+	appendNodeFile(t, dir, fillsFile, nodeRecord(22, fillEvents))
+	expectData(t, subscriber, "fills", 22, fillEvents)
+}
+
+func TestWebSocketRejectsInvalidCommands(t *testing.T) {
+	endpoint := startTestWebSocket(t)
+	subscriber := dialTestSubscriber(t, endpoint)
+	cases := []struct {
+		name    string
+		kind    int
+		payload string
+		channel string
+	}{
+		{"malformed JSON", websocket.TextMessage, `{"method":`, ""},
+		{"binary command", websocket.BinaryMessage, `{"method":"subscribe","channel":"fills"}`, ""},
+		{"unknown channel", websocket.TextMessage, `{"method":"subscribe","channel":"unknown"}`, "unknown"},
+		{"missing channel", websocket.TextMessage, `{"method":"subscribe"}`, ""},
+		{"unknown method", websocket.TextMessage, `{"method":"publish","channel":"fills"}`, "fills"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeTestFrame(t, subscriber, tc.kind, tc.payload)
+			reply := expectFrame(t, subscriber, "error", tc.channel)
+			if reply.Message == "" {
+				t.Fatal("error reply had no message")
+			}
+		})
+	}
+	subscription(t, subscriber, "subscribe", "fills", "subscribed")
+}
+
+type testWebSocket struct {
+	url string
+	hub *hub
+}
+
+func startTestWebSocket(t *testing.T) testWebSocket {
+	t.Helper()
+	h := newHub()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ws", h.serveWebSocket)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	t.Cleanup(h.close)
+	return testWebSocket{url: "ws" + strings.TrimPrefix(server.URL, "http") + "/ws", hub: h}
+}
+
+func dialTestSubscriber(t *testing.T, endpoint testWebSocket) *websocket.Conn {
+	t.Helper()
+	dialer := websocket.Dialer{HandshakeTimeout: testIOTimeout}
+	conn, response, err := dialer.Dial(endpoint.url, nil)
+	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		t.Fatalf("connect subscriber to %s: %v", endpoint.url, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+func startTestCollector(t *testing.T, cfg collector.Config, h *hub) func() {
+	t.Helper()
+	source, err := collector.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := newHub()
-	server := httptest.NewServer(http.HandlerFunc(h.serveWebSocket))
-	t.Cleanup(server.Close)
-	t.Cleanup(h.close)
-
-	dial := func() *websocket.Conn {
-		t.Helper()
-		conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = conn.Close() })
-		return conn
-	}
-	read := func(conn *websocket.Conn, kind, channel string) message {
-		t.Helper()
-		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			t.Fatal(err)
-		}
-		var reply message
-		if err := conn.ReadJSON(&reply); err != nil {
-			t.Fatal(err)
-		}
-		if reply.Type != kind || reply.Channel != channel {
-			t.Fatalf("got %s/%s, want %s/%s", reply.Type, reply.Channel, kind, channel)
-		}
-		return reply
-	}
-	send := func(conn *websocket.Conn, method, channel, reply string) {
-		t.Helper()
-		if err := conn.WriteJSON(command{Method: method, Channel: channel}); err != nil {
-			t.Fatal(err)
-		}
-		read(conn, reply, channel)
-	}
-
-	first, second := dial(), dial()
-	send(first, "subscribe", "fills", "subscribed")
-	send(second, "subscribe", "miscEvents", "subscribed")
-	send(second, "subscribe", "twapStatuses", "subscribed")
-	send(first, "subscribe", "unknown", "error")
-
-	writeRecord(collector.Fills, 1)
-	writeRecord(collector.MiscEvents, 2)
-	writeRecord(collector.TWAPStatuses, 3)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() { result <- source.Run(ctx, h.publish) }()
-	t.Cleanup(func() {
+	stop := sync.OnceFunc(func() {
 		cancel()
-		if err := <-result; !errors.Is(err, context.Canceled) {
-			t.Errorf("collector stopped with %v", err)
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("collector stopped with %v", err)
+			}
+		case <-time.After(testIOTimeout):
+			t.Error("collector did not stop")
 		}
 	})
+	t.Cleanup(stop)
+	return stop
+}
 
-	fill := read(first, "data", "fills").Data
-	if fill == nil || fill.BlockNumber != 1 || fill.BlockTime.Nanosecond() != 123456789 ||
-		len(fill.Events) != 1 || string(fill.Events[0]) != `["0xabc",{"px":"3600"}]` {
-		t.Fatalf("unexpected fill: %+v", fill)
-	}
-	blocks := map[string]uint64{"miscEvents": 2, "twapStatuses": 3}
-	for range 2 {
-		if err := second.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			t.Fatal(err)
-		}
-		var reply message
-		if err := second.ReadJSON(&reply); err != nil {
-			t.Fatal(err)
-		}
-		block, expected := blocks[reply.Channel]
-		if !expected || reply.Type != "data" || reply.Data == nil || reply.Data.BlockNumber != block ||
-			len(reply.Data.Events) != 1 || !json.Valid(reply.Data.Events[0]) {
-			t.Fatalf("unexpected message: %+v", reply)
-		}
-		delete(blocks, reply.Channel)
-	}
+func nodeRecord(block uint64, events string) string {
+	return fmt.Sprintf(`{"block_number":%d,"block_time":%q,"local_time":%q,"events":%s}`+"\n", block, testBlockTime, testLocalTime, events)
+}
 
-	send(first, "unsubscribe", "fills", "unsubscribed")
-	send(second, "subscribe", "fills", "subscribed")
-	writeRecord(collector.Fills, 4)
-	next := read(second, "data", "fills").Data
-	if next == nil || next.BlockNumber != 4 {
-		t.Fatalf("unexpected appended fill: %+v", next)
+func appendNodeFile(t *testing.T, dir, relativeFile, content string) {
+	t.Helper()
+	path := filepath.Join(dir, relativeFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
 	}
-	send(first, "subscribe", "fills", "subscribed")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString(content)
+	if err := errors.Join(err, file.Close()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type receivedFrame struct {
+	Type    string          `json:"type"`
+	Channel string          `json:"channel"`
+	Data    json.RawMessage `json:"data"`
+	Message string          `json:"message"`
+}
+
+func expectFrame(t *testing.T, conn *websocket.Conn, kind, channel string) receivedFrame {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(testIOTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	opcode, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read %s/%s: %v", kind, channel, err)
+	}
+	if opcode != websocket.TextMessage {
+		t.Fatalf("got WebSocket opcode %d, want text", opcode)
+	}
+	var frame receivedFrame
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		t.Fatalf("decode WebSocket message: %v", err)
+	}
+	if frame.Type != kind || frame.Channel != channel {
+		t.Fatalf("got %s, want %s/%s", payload, kind, channel)
+	}
+	return frame
+}
+
+func expectData(t *testing.T, conn *websocket.Conn, channel string, block uint64, events string) {
+	t.Helper()
+	frame := expectFrame(t, conn, "data", channel)
+	var data struct {
+		BlockNumber uint64          `json:"block_number"`
+		BlockTime   string          `json:"block_time"`
+		LocalTime   string          `json:"local_time"`
+		Events      json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(frame.Data, &data); err != nil {
+		t.Fatalf("decode %s data: %v", channel, err)
+	}
+	if data.BlockNumber != block || data.BlockTime != testBlockTime ||
+		data.LocalTime != testLocalTime || string(data.Events) != events {
+		t.Fatalf("unexpected %s data: %s", channel, frame.Data)
+	}
+}
+
+func subscription(t *testing.T, conn *websocket.Conn, method, channel, ack string) {
+	t.Helper()
+	writeTestFrame(t, conn, websocket.TextMessage, fmt.Sprintf(`{"method":%q,"channel":%q}`, method, channel))
+	expectFrame(t, conn, ack, channel)
+}
+
+func writeTestFrame(t *testing.T, conn *websocket.Conn, kind int, payload string) {
+	t.Helper()
+	if err := conn.SetWriteDeadline(time.Now().Add(testIOTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteMessage(kind, []byte(payload)); err != nil {
+		t.Fatal(err)
+	}
 }
