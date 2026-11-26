@@ -3,7 +3,7 @@ module github.com/luanruisong/hyperliquid-fills-stream
 go 1.24.0
 
 require (
-	github.com/gorilla/websocket v1.5.3
+	github.com/gorilla/websocket v1.5.4-0.20240701034025-d67f41855da4
 	github.com/luanruisong/hyperliquid-collector v0.0.0-20261126031812-2c18bc7f8fb9
 	github.com/spf13/viper v1.21.0
 )
@@ -19,6 +19,7 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/sys v0.29.0 // indirect
+	golang.org/x/net v0.36.0 // indirect
+	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
